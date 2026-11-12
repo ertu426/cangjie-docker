@@ -10,6 +10,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '30 0 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -110,7 +112,7 @@ jobs:
             SDK_URL=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_URL || env.SDK_AARCH64_URL }}
             SDK_SHA256=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_SHA256 || env.SDK_AARCH64_SHA256 }}
             CANGJIE_VERSION=${{ env.CANGJIE_VERSION }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
 
