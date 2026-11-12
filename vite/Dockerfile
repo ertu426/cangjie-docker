@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 ertu426
 
 ARG ARCH=amd64
 ARG SDK_ARCH=x86_64
@@ -65,6 +67,7 @@ LABEL org.opencontainers.image.version="${CANGJIE_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/ertu426/cangjie-docker"
 LABEL org.opencontainers.image.url="https://github.com/ertu426/cangjie-docker"
 LABEL org.opencontainers.image.documentation="https://github.com/ertu426/cangjie-docker#readme"
+LABEL org.opencontainers.image.authors="ertu426"
 LABEL org.opencontainers.image.vendor="ertu426"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.base.name="buildpack-deps:trixie"
