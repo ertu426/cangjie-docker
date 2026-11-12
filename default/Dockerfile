@@ -49,11 +49,22 @@ ARG CANGJIE_VERSION
 COPY --from=extractor /out/ /
 COPY --from=python311 /out/python3.11 /usr/lib/python3.11
 COPY --from=python311 /out/lib/libpython3.11.so.1.0 /usr/local/lib/libpython3.11.so.1.0
-RUN ldconfig
+RUN chmod -R a+rX /opt/cangjie && ldconfig
+
+RUN set -eux; \
+    groupadd --gid 1000 vscode; \
+    useradd --uid 1000 --gid 1000 -m -s /bin/bash vscode; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends sudo; \
+    rm -rf /var/lib/apt/lists/*; \
+    echo "vscode ALL=(root) NOPASSWD:ALL" > "/etc/sudoers.d/vscode"; \
+    chmod 0440 "/etc/sudoers.d/vscode"
+
+USER vscode
 
 ENV CANGJIE_HOME="/opt/cangjie"
 ENV LD_LIBRARY_PATH="/opt/cangjie/runtime/lib/linux_${SDK_ARCH}_cjnative:/opt/cangjie/tools/lib"
-ENV PATH="/opt/cangjie/bin:/opt/cangjie/tools/bin:$PATH:/root/.cjpm/bin"
+ENV PATH="/opt/cangjie/bin:/opt/cangjie/tools/bin:$PATH:/home/vscode/.cjpm/bin"
 
 LABEL org.opencontainers.image.title="Cangjie ${CANGJIE_VERSION} (trixie/${ARCH})"
 LABEL org.opencontainers.image.description="Prebuilt Cangjie STS ${CANGJIE_VERSION} SDK on trixie (${ARCH}, cjnative backend)"
