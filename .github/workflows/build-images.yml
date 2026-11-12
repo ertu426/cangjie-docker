@@ -1,0 +1,220 @@
+name: Build Multi-Arch Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/cangjie
+
+  # =====================================================
+  # 版本号：改这里即可发布新版本；tag 名需与 v${CANGJIE_VERSION} 一致
+  # =====================================================
+  CANGJIE_VERSION: "1.2.1"
+
+  # 仓颉 SDK 下载信息（Dockerfile 里通过 build-arg 使用）
+  SDK_AMD64_URL: "https://cangjie-lang.cn/v1/files/auth/downLoad?nsId=142267&fileName=cangjie-sdk-linux-x64-1.2.1.tar.gz&objectKey=6af2edbae4bd101f57762f7c"
+  SDK_AMD64_SHA256: "5616624fcb48db150df2accde6669a2c8cc5e851d79e623a5469c4e4cd7a491f"
+  SDK_AARCH64_URL: "https://cangjie-lang.cn/v1/files/auth/downLoad?nsId=142267&fileName=cangjie-sdk-linux-aarch64-1.2.1.tar.gz&objectKey=6af2edbbe4bd101f57762f7d"
+  SDK_AARCH64_SHA256: "5c0f58166f287d7d1317eca416446bcdfd22d0fe8bfc62c38de3e4bfda8b791d"
+
+jobs:
+  # ===============================================================
+  # 1. 每个变体 × 每个架构单独构建，按 digest 推送
+  # ===============================================================
+  build:
+    name: Build ${{ matrix.variant }} (${{ matrix.platform.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, vite]
+        platform:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches CANGJIE_VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "v${CANGJIE_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::git tag ${GITHUB_REF_NAME} 与 env.CANGJIE_VERSION=${CANGJIE_VERSION} 不一致"
+            echo "::error::请把 env.CANGJIE_VERSION 改为 ${GITHUB_REF_NAME#v} 或改推送正确 tag"
+            exit 1
+          fi
+          echo "版本校验通过：v${CANGJIE_VERSION}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- PR：只构建验证，不推送 ---
+      - name: Build (PR only, no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ matrix.variant }}/Dockerfile
+          platforms: ${{ matrix.platform.platform }}
+          push: false
+          build-args: |
+            ARCH=${{ matrix.platform.arch }}
+            SDK_ARCH=${{ matrix.platform.arch == 'amd64' && 'x86_64' || 'aarch64' }}
+            SDK_URL=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_URL || env.SDK_AARCH64_URL }}
+            SDK_SHA256=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_SHA256 || env.SDK_AARCH64_SHA256 }}
+            CANGJIE_VERSION=${{ env.CANGJIE_VERSION }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
+
+      # --- 正式构建：按 digest 推送，后面 merge job 合并成多架构 ---
+      - name: Build and push by digest
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ matrix.variant }}/Dockerfile
+          platforms: ${{ matrix.platform.platform }}
+          build-args: |
+            ARCH=${{ matrix.platform.arch }}
+            SDK_ARCH=${{ matrix.platform.arch == 'amd64' && 'x86_64' || 'aarch64' }}
+            SDK_URL=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_URL || env.SDK_AARCH64_URL }}
+            SDK_SHA256=${{ matrix.platform.arch == 'amd64' && env.SDK_AMD64_SHA256 || env.SDK_AARCH64_SHA256 }}
+            CANGJIE_VERSION=${{ env.CANGJIE_VERSION }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.platform.arch }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests/${{ matrix.variant }}
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${{ matrix.variant }}/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/${{ matrix.variant }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===============================================================
+  # 2. 每个变体合并 amd64 + arm64 为多架构 manifest，按 env 版本打标签
+  # ===============================================================
+  merge:
+    name: Merge ${{ matrix.variant }} manifest
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, vite]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.variant }}-*
+          path: /tmp/digests/${{ matrix.variant }}
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ===============================================================
+      # 标签规则（全部用 env.CANGJIE_VERSION，不用 git tag 名做版本）
+      #
+      #  发布（push tag v* / workflow_dispatch）:
+      #    default 变体:
+      #      latest
+      #      ${CANGJIE_VERSION}            例: 1.2.1
+      #      v${CANGJIE_VERSION}           例: v1.2.1
+      #      trixie
+      #      trixie-${CANGJIE_VERSION}     例: trixie-1.2.1
+      #    vite 变体:
+      #      vite
+      #      ${CANGJIE_VERSION}-vite       例: 1.2.1-vite
+      #      v${CANGJIE_VERSION}-vite      例: v1.2.1-vite
+      #      trixie-vite
+      #      trixie-${CANGJIE_VERSION}-vite 例: trixie-1.2.1-vite
+      #
+      #  分支 push（main）: 只打开发标签
+      #    default 变体: main / main-trixie
+      #    vite    变体: main-vite
+      # ===============================================================
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # ---- default 变体 · 正式发布 ----
+            type=raw,value=latest,enable=${{ matrix.variant == 'default' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=${{ env.CANGJIE_VERSION }},enable=${{ matrix.variant == 'default' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=v${{ env.CANGJIE_VERSION }},enable=${{ matrix.variant == 'default' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=trixie,enable=${{ matrix.variant == 'default' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=trixie-${{ env.CANGJIE_VERSION }},enable=${{ matrix.variant == 'default' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+
+            # ---- vite 变体 · 正式发布 ----
+            type=raw,value=vite,enable=${{ matrix.variant == 'vite' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=${{ env.CANGJIE_VERSION }}-vite,enable=${{ matrix.variant == 'vite' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=v${{ env.CANGJIE_VERSION }}-vite,enable=${{ matrix.variant == 'vite' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=trixie-vite,enable=${{ matrix.variant == 'vite' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+            type=raw,value=trixie-${{ env.CANGJIE_VERSION }}-vite,enable=${{ matrix.variant == 'vite' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+
+            # ---- 分支 push · 开发标签（metadata-action 原生只在 branch push 生效）----
+            type=ref,event=branch,enable=${{ matrix.variant == 'default' }}
+            type=ref,event=branch,suffix=-trixie,enable=${{ matrix.variant == 'default' }}
+            type=ref,event=branch,suffix=-vite,enable=${{ matrix.variant == 'vite' }}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests/${{ matrix.variant }}
+        run: |
+          docker buildx imagetools create \
+            $(printf -- '-t %s ' ${{ steps.meta.outputs.tags }}) \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect manifest
+        run: |
+          first_tag=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "Inspecting $first_tag"
+          docker buildx imagetools inspect "$first_tag"
